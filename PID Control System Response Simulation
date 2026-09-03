@@ -1,0 +1,75 @@
+// ================================================================
+// Simulator Respons Sistem Kontrol PID — Second-Order Plant
+// Ayu Kurniawati | Simulasi tanpa hardware fisik (Wokwi)
+// ================================================================
+
+// --- Parameter PID 
+float Kp = 1.62;
+float Ki = 5.89;
+float Kd = 0.111375;
+
+// --- Parameter Plant 
+float wn   = 5.0;   // natural frequency (rad/s)
+float zeta = 0.5;   // damping ratio
+
+// --- Parameter Simulasi ---
+float setpoint = 12.0;   
+float dt       = 0.01;   // time step simulasi (s)
+float simTime  = 10.0;   // total durasi simulasi (s)
+
+// --- Variabel State ---
+float x = 0, v = 0;          // output (posisi/tegangan) & turunannya
+float integral = 0, prevError = 0;
+float time = 0;
+
+// --- Variabel Metrik Evaluasi ---
+float maxX = 0;
+float settleTime = 0;
+bool  simulationDone = false;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("time,setpoint,output");
+}
+
+void loop() {
+  if (time <= simTime) {
+    // --- Hitung sinyal kontrol PID ---
+    float error = setpoint - x;
+    integral += error * dt;
+    float derivative = (error - prevError) / dt;
+    float u = Kp * error + Ki * integral + Kd * derivative;
+    prevError = error;
+
+    // --- Update dinamika plant (integrasi Euler) ---
+    float a = (wn * wn * u) - (2 * zeta * wn * v) - (wn * wn * x);
+    v += a * dt;
+    x += v * dt;
+
+    // --- Catat metrik performa ---
+    if (x > maxX) maxX = x;
+    float tolerance = 0.02 * setpoint;  // toleransi ±2%
+    if (abs(error) > tolerance) settleTime = time;
+
+    // --- Kirim data ke Serial Plotter (format: label:nilai) ---
+    Serial.print("Setpoint:");
+    Serial.print(setpoint);
+    Serial.print(",Output:");
+    Serial.println(x);
+
+    time += dt;
+    delay(10); // agar grafik plotter tidak terlalu cepat
+  } 
+  else if (!simulationDone) {
+    // --- Cetak ringkasan hasil setelah simulasi selesai ---
+    float overshoot = ((maxX - setpoint) / setpoint) * 100.0;
+    Serial.println("\n=== HASIL SIMULASI ===");
+    Serial.print("Maximum Overshoot : "); Serial.print(overshoot); Serial.println(" %");
+    Serial.print("Settling Time     : "); Serial.print(settleTime); Serial.println(" s");
+    Serial.print("Kp, Ki, Kd        : ");
+    Serial.print(Kp); Serial.print(", ");
+    Serial.print(Ki); Serial.print(", ");
+    Serial.println(Kd);
+    simulationDone = true;
+  }
+}
