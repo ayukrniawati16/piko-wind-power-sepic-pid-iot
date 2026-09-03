@@ -1,0 +1,930 @@
+#include <EEPROM.h>
+#include <LiquidCrystal_I2C.h>
+#include <math.h>
+
+// ============================================================
+// PID STABIL 12V + V1725 SENSOR + LCD 16x2
+// ============================================================
+
+// LCD I2C
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ============================================================
+// PWM CONFIG
+// ============================================================
+
+const uint16_t TIMER_TOP = 532;
+
+float currentDuty = 45.0;
+
+const int pwmPin = 11;
+
+// ============================================================
+// SENSOR
+// ============================================================
+
+const int analogPin = A0;
+const int sensorV1725Pin = A1;
+
+const int MAX_ADC = 1023;
+
+// ============================================================
+// VOLTAGE DIVIDER
+// ============================================================
+
+float R1 = 30000.0;
+float R2 = 12000.0;
+
+float voltageDividerRatio;
+
+// ============================================================
+// PWM CALIBRATION
+// ============================================================
+
+float kalibrasiFactorPWM = 1.0;
+
+bool kalibrasiModePWM = false;
+
+const int EEPROM_ADDR_PWM = 0;
+
+// ============================================================
+// V1725 SENSOR
+// ============================================================
+
+float teganganSensorV1725 = 0.0;
+float teganganInputV1725 = 0.0;
+
+// Kalibrasi tambahan
+float slopeV1725 = 1.0;
+float interceptV1725 = 0.0;
+
+bool kalibrasiV1725Selesai = false;
+
+const int EEPROM_ADDR_V1725_SLOPE = 10;
+const int EEPROM_ADDR_V1725_INT = 20;
+
+// ============================================================
+// FILTER
+// ============================================================
+
+const int SAMPLES = 20;
+
+const int FILTER_BUFFER_SIZE = 8;
+
+float voutBuffer[FILTER_BUFFER_SIZE];
+
+int filterIndex = 0;
+
+float voutFiltered = 12.0;
+
+const float NOISE_THRESHOLD = 0.03;
+
+const float FILTER_ALPHA = 0.05;
+
+// ============================================================
+// TIMING
+// ============================================================
+
+const unsigned long SAMPLING_INTERVAL = 1000;
+
+const unsigned long LCD_INTERVAL = 200;
+
+unsigned long lastUpdate = 0;
+
+unsigned long lastLcdUpdate = 0;
+
+// ============================================================
+// PID
+// ============================================================
+
+const float setpoint = 12.0;
+
+float Kp = 1.8;
+float Ki = 0.02;
+float Kd = 0.02;
+
+float error = 0.0;
+float prevError = 0.0;
+float deltaError = 0.0;
+float errorSum = 0.0;
+float pidOutput = 0.0;
+
+unsigned long prevTimePid = 0;
+
+bool pidEnabled = true;
+
+float lastDuty = 45.0;
+
+// ============================================================
+// LIMIT
+// ============================================================
+
+const float MAX_DUTY_CHANGE = 0.1;
+
+const float PID_INTERVAL = 50;
+
+const float MAX_I_SUM = 5.0;
+
+const float MAX_DUTY_KODE = 65;
+
+// ============================================================
+// SERIAL
+// ============================================================
+
+String inputString = "";
+
+bool stringComplete = false;
+
+// ============================================================
+// FUNCTION DECLARATION
+// ============================================================
+
+void updateLcd();
+void streamDataExcel();
+
+void bacaPWM(float &voutRaw,
+             float &voutFilter);
+
+void bacaV1725();
+
+void runPID();
+
+void setDutyCycle(float dutyInput);
+
+void printExcelHeader();
+
+void handleSerial();
+
+void serialEvent();
+
+void cekAutoKalibrasiPWM();
+
+void lakukanAutoKalibrasiPWM(
+  float teganganReferensi);
+
+void loadKalibrasiPWM();
+
+void resetKalibrasiPWM();
+
+void lakukanKalibrasiV1725();
+
+void loadKalibrasiV1725();
+
+void resetKalibrasiV1725();
+
+float bacaADCRata(int pin);
+
+float applyFilter(float voutRaw);
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(9600);
+
+  inputString.reserve(30);
+
+  lcd.init();
+
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print("PID 12V + V1725");
+
+  delay(1500);
+
+  pinMode(analogPin, INPUT);
+
+  pinMode(sensorV1725Pin, INPUT);
+
+  pinMode(pwmPin, OUTPUT);
+
+  for (int i = 0;
+       i < FILTER_BUFFER_SIZE;
+       i++) {
+
+    voutBuffer[i] = 12.0;
+  }
+
+  voltageDividerRatio =
+    R2 / (R1 + R2);
+
+  loadKalibrasiPWM();
+
+  loadKalibrasiV1725();
+
+  // ==========================================================
+  // TIMER1 PWM
+  // ==========================================================
+
+  noInterrupts();
+
+  TCCR1A = 0;
+
+  TCCR1B = 0;
+
+  TCCR1A =
+    (1 << COM1A1) |
+    (1 << WGM11);
+
+  ICR1 = TIMER_TOP;
+
+  setDutyCycle(45.0);
+
+  TCCR1B =
+    (1 << WGM13) |
+    (1 << WGM12) |
+    (1 << CS10);
+
+  interrupts();
+
+  prevTimePid = millis();
+
+  lastUpdate = millis();
+
+  lastLcdUpdate = millis();
+
+  printExcelHeader();
+
+  Serial.println("READY");
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+
+  unsigned long now = millis();
+
+  // ==========================================================
+  // STREAM DATA EXCEL
+  // ==========================================================
+
+  if (now - lastUpdate >= SAMPLING_INTERVAL) {
+
+    streamDataExcel();
+
+    lastUpdate = now;
+  }
+
+  // ==========================================================
+  // LCD
+  // ==========================================================
+
+  if (now - lastLcdUpdate >= LCD_INTERVAL) {
+
+    updateLcd();
+
+    lastLcdUpdate = now;
+  }
+
+  // ==========================================================
+  // PID
+  // ==========================================================
+
+  if (now - prevTimePid >= PID_INTERVAL) {
+
+    runPID();
+
+    prevTimePid = now;
+  }
+
+  handleSerial();
+
+  cekAutoKalibrasiPWM();
+
+  serialEvent();
+}
+
+// ============================================================
+// LCD
+// ============================================================
+
+void updateLcd() {
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print("V:");
+
+  lcd.print(voutFiltered, 2);
+
+  lcd.print(" D:");
+
+  lcd.print(currentDuty, 0);
+
+  lcd.setCursor(0, 1);
+
+  lcd.print("In:");
+
+  lcd.print(teganganInputV1725, 1);
+
+  lcd.print(" E:");
+
+  lcd.print(error, 1);
+}
+
+// ============================================================
+// STREAM DATA
+// ============================================================
+
+void streamDataExcel() {
+
+  float voutRaw;
+
+  float voutFilter;
+
+  bacaPWM(voutRaw,
+           voutFilter);
+
+  bacaV1725();
+
+  error =
+    setpoint - voutFilter;
+
+  deltaError =
+    error - prevError;
+
+  prevError = error;
+
+  Serial.print(
+    millis() / 1000.0,
+    2);
+
+  Serial.print(",");
+
+  Serial.print(
+    voutFilter,
+    2);
+
+  Serial.print(",");
+
+  Serial.print(
+    setpoint,
+    2);
+
+  Serial.print(",");
+
+  Serial.print(
+    error,
+    2);
+
+  Serial.print(",");
+
+  Serial.print(
+    deltaError,
+    2);
+
+  Serial.print(",");
+
+  Serial.print(
+    Kp,
+    2);
+
+  Serial.print(",");
+
+  Serial.print(
+    Ki,
+    2);
+
+  Serial.print(",");
+
+  Serial.print(
+    Kd,
+    2);
+
+  Serial.print(",");
+
+  Serial.print(
+    currentDuty,
+    2);
+
+  Serial.print(",");
+
+  Serial.println(
+    teganganInputV1725,
+    2);
+}
+
+// ============================================================
+// PWM SENSOR
+// ============================================================
+
+float bacaADCRata(int pin) {
+
+  long total = 0;
+
+  for (int i = 0;
+       i < SAMPLES;
+       i++) {
+
+    total += analogRead(pin);
+
+    delayMicroseconds(10);
+  }
+
+  return total /
+         (float)SAMPLES;
+}
+
+float applyFilter(float voutRaw) {
+
+  static float lastVoutRaw = 12.0;
+
+  if (abs(voutRaw - lastVoutRaw)
+      < NOISE_THRESHOLD) {
+
+    voutRaw = lastVoutRaw;
+  }
+
+  lastVoutRaw = voutRaw;
+
+  voutBuffer[filterIndex] =
+    voutRaw;
+
+  filterIndex =
+    (filterIndex + 1)
+    % FILTER_BUFFER_SIZE;
+
+  float sum = 0;
+
+  for (int i = 0;
+       i < FILTER_BUFFER_SIZE;
+       i++) {
+
+    sum += voutBuffer[i];
+  }
+
+  float movingAvg =
+    sum / FILTER_BUFFER_SIZE;
+
+  voutFiltered =
+    FILTER_ALPHA *
+    movingAvg +
+    (1 - FILTER_ALPHA)
+    * voutFiltered;
+
+  return voutFiltered;
+}
+
+void bacaPWM(float &voutRaw,
+             float &voutFilter) {
+
+  float adc =
+    bacaADCRata(analogPin);
+
+  float v_adc =
+    (adc / MAX_ADC)
+    * 5.0;
+
+  voutRaw =
+    v_adc *
+    kalibrasiFactorPWM /
+    voltageDividerRatio;
+
+  voutFilter =
+    applyFilter(voutRaw);
+}
+
+// ============================================================
+// V1725 SENSOR
+// ============================================================
+
+void bacaV1725() {
+
+  long total = 0;
+
+  for (int i = 0;
+       i < 50;
+       i++) {
+
+    total +=
+      analogRead(sensorV1725Pin);
+
+    delayMicroseconds(50);
+  }
+
+  float adcAverage =
+    total / 50.0;
+
+  const float ADC_REF = 4.98;
+
+  // ==========================================================
+  // ADC -> Tegangan Sensor
+  // ==========================================================
+
+  teganganSensorV1725 =
+    adcAverage *
+    (ADC_REF / MAX_ADC);
+
+  // ==========================================================
+  // PROTEKSI NaN
+  // ==========================================================
+
+  if (isnan(teganganSensorV1725) ||
+      isinf(teganganSensorV1725)) {
+
+    teganganSensorV1725 = 0;
+  }
+
+  // ==========================================================
+  // KALIBRASI MANUAL TERBARU
+  // ==========================================================
+
+  // Multimeter ≈ 5.5V
+  // Excel sebelumnya ≈ 4.6V
+  // Faktor dinaikkan
+
+  const float FAKTOR_V1725 = 5.12;
+
+  teganganInputV1725 =
+    teganganSensorV1725 *
+    FAKTOR_V1725;
+
+  // ==========================================================
+  // EEPROM KALIBRASI TAMBAHAN
+  // ==========================================================
+
+  if (kalibrasiV1725Selesai) {
+
+    teganganInputV1725 =
+      (teganganInputV1725 *
+       slopeV1725)
+      + interceptV1725;
+  }
+
+  // ==========================================================
+  // PROTEKSI INVALID
+  // ==========================================================
+
+  if (isnan(teganganInputV1725) ||
+      isinf(teganganInputV1725)) {
+
+    teganganInputV1725 = 0;
+  }
+
+  // ==========================================================
+  // LOW PASS FILTER
+  // ==========================================================
+
+  static float filteredV1725 = 0;
+
+  filteredV1725 =
+    (0.25 *
+     teganganInputV1725)
+    +
+    (0.75 *
+     filteredV1725);
+
+  if (isnan(filteredV1725) ||
+      isinf(filteredV1725)) {
+
+    filteredV1725 = 0;
+  }
+
+  teganganInputV1725 =
+    filteredV1725;
+
+  // ==========================================================
+  // BATAS MINIMUM
+  // ==========================================================
+
+  if (teganganInputV1725 < 0.05) {
+
+    teganganInputV1725 = 0;
+  }
+}
+
+// ============================================================
+// PID
+// ============================================================
+
+void runPID() {
+
+  if (!pidEnabled ||
+      kalibrasiModePWM)
+    return;
+
+  float voutRaw;
+
+  float voutFilter;
+
+  bacaPWM(voutRaw,
+           voutFilter);
+
+  error =
+    setpoint - voutFilter;
+
+  deltaError =
+    error - prevError;
+
+  prevError = error;
+
+  static float holdDuty = 45.0;
+
+  if (abs(error) < 0.15) {
+
+    setDutyCycle(holdDuty);
+
+    return;
+  }
+
+  float dt =
+    PID_INTERVAL / 1000.0;
+
+  float pTerm =
+    Kp * error;
+
+  errorSum +=
+    error * dt;
+
+  errorSum =
+    constrain(errorSum,
+              -MAX_I_SUM,
+              MAX_I_SUM);
+
+  float iTerm =
+    Ki * errorSum;
+
+  float derivative =
+    deltaError / dt;
+
+  float dTerm =
+    Kd * derivative;
+
+  pidOutput =
+    pTerm +
+    iTerm +
+    dTerm;
+
+  pidOutput =
+    constrain(pidOutput,
+              -3.0,
+              3.0);
+
+  float dutyBaru =
+    currentDuty +
+    pidOutput;
+
+  float deltaDuty =
+    dutyBaru -
+    lastDuty;
+
+  if (abs(deltaDuty)
+      > MAX_DUTY_CHANGE) {
+
+    dutyBaru =
+      lastDuty +
+      (deltaDuty > 0 ?
+       MAX_DUTY_CHANGE :
+       -MAX_DUTY_CHANGE);
+  }
+
+  setDutyCycle(dutyBaru);
+
+  holdDuty =
+    currentDuty;
+
+  lastDuty =
+    currentDuty;
+}
+
+// ============================================================
+// SET DUTY
+// ============================================================
+
+void setDutyCycle(float dutyInput) {
+
+  if (dutyInput < 35.0)
+    dutyInput = 35.0;
+
+  if (dutyInput > MAX_DUTY_KODE)
+    dutyInput = MAX_DUTY_KODE;
+
+  currentDuty = dutyInput;
+
+  float dutyFisik =
+    dutyInput * 0.8620;
+
+  uint16_t ocr =
+    (uint16_t)
+    ((dutyFisik / 100.0)
+    * TIMER_TOP);
+
+  OCR1A =
+    constrain(ocr,
+              0,
+              TIMER_TOP);
+}
+
+// ============================================================
+// HEADER
+// ============================================================
+
+void printExcelHeader() {
+
+  Serial.println(
+    "Waktu,"
+    "TeganganOutputPWM,"
+    "Setpoint,"
+    "Error,"
+    "DeltaError,"
+    "Kp,"
+    "Ki,"
+    "Kd,"
+    "DutyCycle,"
+    "TeganganInputV1725");
+}
+
+// ============================================================
+// SERIAL
+// ============================================================
+
+void serialEvent() {
+
+  while (Serial.available()) {
+
+    char inChar =
+      (char)Serial.read();
+
+    if (inChar == '\n') {
+
+      stringComplete = true;
+
+    } else {
+
+      inputString += inChar;
+    }
+  }
+}
+
+void handleSerial() {
+
+  if (!stringComplete)
+    return;
+
+  inputString.trim();
+
+  String cmd = inputString;
+
+  inputString = "";
+
+  stringComplete = false;
+
+  cmd.toUpperCase();
+
+  if (cmd == "VR") {
+
+    resetKalibrasiV1725();
+  }
+
+  else if (cmd == "V") {
+
+    Serial.print(
+      "Input V1725: ");
+
+    Serial.println(
+      teganganInputV1725,
+      3);
+  }
+}
+
+// ============================================================
+// PWM AUTO KALIBRASI
+// ============================================================
+
+void cekAutoKalibrasiPWM() {
+
+  static int stabilCount = 0;
+
+  float voltageOutRaw =
+    (analogRead(analogPin)
+    / (float)MAX_ADC)
+    * 5.0;
+
+  if (voltageOutRaw >= 4.8 &&
+      voltageOutRaw <= 5.2) {
+
+    stabilCount++;
+
+    if (stabilCount >= 10) {
+
+      lakukanAutoKalibrasiPWM(5.0);
+
+      stabilCount = 0;
+    }
+
+  } else {
+
+    stabilCount = 0;
+  }
+}
+
+void lakukanAutoKalibrasiPWM(
+  float teganganReferensi) {
+
+  float voltageOutRaw =
+    (analogRead(analogPin)
+    / (float)MAX_ADC)
+    * 5.0;
+
+  if (voltageOutRaw > 0.01) {
+
+    kalibrasiFactorPWM =
+      teganganReferensi /
+      voltageOutRaw;
+
+    EEPROM.put(
+      EEPROM_ADDR_PWM,
+      kalibrasiFactorPWM);
+  }
+}
+
+void loadKalibrasiPWM() {
+
+  float savedFactor;
+
+  EEPROM.get(
+    EEPROM_ADDR_PWM,
+    savedFactor);
+
+  if (savedFactor >= 0.5 &&
+      savedFactor <= 2.0) {
+
+    kalibrasiFactorPWM =
+      savedFactor;
+  }
+}
+
+void resetKalibrasiPWM() {
+
+  kalibrasiFactorPWM = 1.0;
+
+  EEPROM.put(
+    EEPROM_ADDR_PWM,
+    kalibrasiFactorPWM);
+}
+
+// ============================================================
+// EEPROM V1725
+// ============================================================
+
+void lakukanKalibrasiV1725() {
+}
+
+void loadKalibrasiV1725() {
+
+  float savedSlope;
+
+  float savedIntercept;
+
+  EEPROM.get(
+    EEPROM_ADDR_V1725_SLOPE,
+    savedSlope);
+
+  EEPROM.get(
+    EEPROM_ADDR_V1725_INT,
+    savedIntercept);
+
+  if (isnan(savedSlope) ||
+      isinf(savedSlope)) {
+
+    savedSlope = 1.0;
+  }
+
+  if (isnan(savedIntercept) ||
+      isinf(savedIntercept)) {
+
+    savedIntercept = 0.0;
+  }
+
+  slopeV1725 =
+    savedSlope;
+
+  interceptV1725 =
+    savedIntercept;
+}
+
+void resetKalibrasiV1725() {
+
+  slopeV1725 = 1.0;
+
+  interceptV1725 = 0.0;
+
+  EEPROM.put(
+    EEPROM_ADDR_V1725_SLOPE,
+    slopeV1725);
+
+  EEPROM.put(
+    EEPROM_ADDR_V1725_INT,
+    interceptV1725);
+
+  Serial.println(
+    "V1725 RESET");
+}
+
